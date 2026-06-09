@@ -28,7 +28,7 @@ function post(url, body) {
 }
 
 function sendTelegram(msg) {
-  return post(`<https://api.telegram.org/bot${TOKEN}/sendMessage`>, {
+  return post(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
     chat_id: CHAT_ID, text: msg, parse_mode: "Markdown"
   });
 }
@@ -244,7 +244,7 @@ function analyzeSMC(candles) {
 }
 
 async function fetchNAS100Candles() {
-  const url = `<https://api.twelvedata.com/time_series?symbol=NDX&interval=5min&outputsize=150&apikey=${API_KEY}`>;
+  const url = `https://api.twelvedata.com/time_series?symbol=NDX&interval=5min&outputsize=150&apikey=${API_KEY}`;
   const data = await get(url);
   if (data.status === "error") throw new Error("Twelve Data: " + data.message);
   if (!data.values || data.values.length === 0) throw new Error("Pas de données NAS100");
