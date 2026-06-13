@@ -1,6 +1,6 @@
 // US100 Signal Bot v4 - Railway / Twelve Data (Node.js)
 // US100 (Nasdaq 100) - M5 - Sessions Londres + New York
-// Pullback + bougie de retournement + H1/H4 + ADX croissant + filtres scalping pro
+// Pullback + bougie de retournement + Fibo + H1/H4 + ADX croissant + filtres scalping pro
 
 const https = require('https');
 
@@ -36,6 +36,8 @@ const US100_CONFIG = {
   roundBuffer: 0.15,
   sessionWarmupMin: 10,
   pointValuePerLot: 1, // a verifier selon specs FTMO pour USTEC
+  fibLookback: 30,
+  fibTolMult: 0.3,
 };
 
 // ─────────────────────────────────────────────
@@ -212,6 +214,29 @@ function swingHigh(candles, n = 10) {
 }
 
 // ─────────────────────────────────────────────
+// FIBONACCI
+// ─────────────────────────────────────────────
+
+function getFibLevels(closed, lookback) {
+  const slice = closed.slice(-lookback);
+  const high = Math.max(...slice.map(c => c.high));
+  const low = Math.min(...slice.map(c => c.low));
+  const range = high - low;
+  return {
+    buyLevels: [high - range * 0.382, high - range * 0.5, high - range * 0.618],
+    sellLevels: [low + range * 0.382, low + range * 0.5, low + range * 0.618],
+  };
+}
+
+function matchedFibLevel(price, levels, atrNow, tolMult) {
+  const labels = ['38.2%', '50%', '61.8%'];
+  for (let i = 0; i < levels.length; i++) {
+    if (Math.abs(price - levels[i]) <= atrNow * tolMult) return labels[i];
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────
 // PATTERNS DE RETOURNEMENT
 // ─────────────────────────────────────────────
 
@@ -313,6 +338,10 @@ function detectPullbackEntry(candles, cfg) {
   const extension = Math.abs(price - emaFNow);
   const notExtended = extension <= atrNow * cfg.extMult;
 
+  const fib = getFibLevels(closed, cfg.fibLookback);
+  const fibBuy = matchedFibLevel(price, fib.buyLevels, atrNow, cfg.fibTolMult);
+  const fibSell = matchedFibLevel(price, fib.sellLevels, atrNow, cfg.fibTolMult);
+
   const recent = closed.slice(-3);
   const touchedFromAbove = recent.some(c => c.low <= emaFNow + atrNow * cfg.pullbackTol);
   const touchedFromBelow = recent.some(c => c.high >= emaFNow - atrNow * cfg.pullbackTol);
@@ -322,11 +351,11 @@ function detectPullbackEntry(candles, cfg) {
 
   const baseOk = volOk && notNearRound && adxOk && adxRising && notExtended;
 
-  if (baseOk && trendBull && touchedFromAbove && bullPattern) {
-    return { direction: 'BUY', price, atrNow, closed };
+  if (baseOk && trendBull && touchedFromAbove && bullPattern && fibBuy) {
+    return { direction: 'BUY', price, atrNow, closed, fibLevel: fibBuy };
   }
-  if (baseOk && trendBear && touchedFromBelow && bearPattern) {
-    return { direction: 'SELL', price, atrNow, closed };
+  if (baseOk && trendBear && touchedFromBelow && bearPattern && fibSell) {
+    return { direction: 'SELL', price, atrNow, closed, fibLevel: fibSell };
   }
   return null;
 }
@@ -386,7 +415,7 @@ async function analyzeUS100() {
   const levels = computeLevels(entry.direction, entry.price, entry.atrNow, entry.closed, cfg);
   const candleTime = entry.closed[entry.closed.length - 1].time;
 
-  return { direction: entry.direction, price: Math.round(entry.price * 100) / 100, ...levels, htf, candleTime };
+  return { direction: entry.direction, price: Math.round(entry.price * 100) / 100, ...levels, htf, candleTime, fibLevel: entry.fibLevel };
 }
 
 // ─────────────────────────────────────────────
@@ -416,7 +445,7 @@ function formatMessage(label, sig, cfg) {
   msg += `🎯 TP3    : ${sig.tp3}  (RR 1:3)\n`;
   msg += '━━━━━━━━━━━━━━━━━━\n';
   msg += `📈 Tendance H1+H4 : ${sig.htf} ✅\n`;
-  msg += `📐 Setup  : Pullback + bougie de retournement\n`;
+  msg += `📐 Setup  : Pullback + bougie + Fibo ${sig.fibLevel}\n`;
   msg += positionSizingText(sig.slDist, cfg) + '\n';
   msg += '━━━━━━━━━━━━━━━━━━\n';
   msg += `📋 Gestion : TP1 -> sécurise 50% + SL a BE | TP2 -> trailing stop\n`;
@@ -457,6 +486,6 @@ async function run() {
   }
 }
 
-sendTelegram(`🤖 US100 Signal Bot v4 démarré (Node.js)\nFiltres pro scalping actifs : pattern de retournement, volatilité min, niveaux ronds, anti-ouverture, max ${MAX_TRADES_PER_DAY} trades/jour ✅\nSymbole d'exécution : USTEC (FTMO)`);
+sendTelegram(`🤖 US100 Signal Bot v4 démarré (Node.js)\nFiltres pro scalping actifs : pattern de retournement, Fibo, volatilité min, niveaux ronds, anti-ouverture, max ${MAX_TRADES_PER_DAY} trades/jour ✅\nSymbole d'exécution : USTEC (FTMO)`);
 run();
 setInterval(run, SCAN_INTERVAL * 1000);
