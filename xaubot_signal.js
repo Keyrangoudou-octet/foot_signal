@@ -1,318 +1,370 @@
-const https = require("https");
+# US100 Signal Bot v4 - Railway / Twelve Data
+# US100 (Nasdaq 100) - M5 - Sessions Londres + New York
+# Pullback + bougie de retournement + H1/H4 + ADX croissant + filtres scalping pro
 
-const TOKEN   = process.env.TELEGRAM_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const API_KEY = process.env.TWELVE_DATA_KEY || "f7bdc6c27e9f4cec9effabb7b8664893";
+import asyncio
+import logging
+import os
+import requests
+import pandas as pd
+from datetime import datetime, timezone
+from telegram import Bot
 
-function get(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, res => {
-      let data = "";
-      res.on("data", d => data += d);
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
-    }).on("error", reject);
-  });
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TWELVE_API_KEY   = os.environ["TWELVE_API_KEY"]
+
+SCAN_INTERVAL = 60
+HTF_CACHE_TTL = 900
+
+ACCOUNT_BALANCE    = float(os.environ.get("ACCOUNT_BALANCE", "0"))   # 0 = désactivé
+RISK_PERCENT       = float(os.environ.get("RISK_PERCENT", "1.0"))
+MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "5"))
+
+SESSION_LONDON_START  = 8
+SESSION_LONDON_END    = 17
+SESSION_NY_START      = 13
+SESSION_NY_END        = 22
+
+US100_CONFIG = {
+    "symbol"       : "NDX",
+    "label"        : "US100",
+    "ema_fast"     : 20,
+    "ema_slow"     : 50,
+    "rsi_period"   : 14,
+    "atr_period"   : 14,
+    "adx_period"   : 14,
+    "adx_min"      : 18,
+    "atr_sl_mult"  : 1.5,
+    "ext_mult"     : 1.2,
+    "pullback_tol" : 0.5,
+    "min_atr_pct"  : 0.05,
+    "round_step"   : 100,
+    "round_buffer" : 0.15,
+    "session_warmup_min": 10,
+    "point_value_per_lot": 1,  # a verifier selon specs FTMO pour USTEC
 }
 
-function post(url, body) {
-  return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body);
-    const u = new URL(url);
-    const req = https.request({
-      hostname: u.hostname, path: u.pathname, method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) }
-    }, res => { res.on("data", () => {}); res.on("end", resolve); });
-    req.on("error", reject);
-    req.write(data); req.end();
-  });
-}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
 
-function sendTelegram(msg) {
-  return post(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-    chat_id: CHAT_ID, text: msg, parse_mode: "Markdown"
-  });
-}
+def is_market_open():
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() >= 5:
+        return False
+    hour = now_utc.hour
+    in_london = SESSION_LONDON_START <= hour < SESSION_LONDON_END
+    in_ny     = SESSION_NY_START     <= hour < SESSION_NY_END
+    return in_london or in_ny
 
-function getSession() {
-  const now = new Date();
-  const t = now.getUTCHours() * 60 + now.getUTCMinutes();
-  if (t >= 12*60 && t < 13*60+30)  return "Pre-Market 🔔";
-  if (t >= 13*60+30 && t < 16*60)  return "NY Open 🇺🇸🔥";
-  if (t >= 18*60 && t < 20*60)     return "NY Afternoon 🇺🇸";
-  return null;
-}
+def minutes_since_session_start():
+    now = datetime.now(timezone.utc)
+    elapsed_london = (now.hour - SESSION_LONDON_START) * 60 + now.minute
+    elapsed_ny     = (now.hour - SESSION_NY_START) * 60 + now.minute
+    candidates = [e for e in [elapsed_london, elapsed_ny] if e >= 0]
+    if not candidates:
+        return 9999
+    return min(candidates)
 
-function isWeekend() {
-  const d = new Date().getUTCDay();
-  return d === 0 || d === 6;
-}
+def get_candles(symbol, interval="5min", outputsize=100):
+    try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol"    : symbol,
+            "interval"  : interval,
+            "outputsize": outputsize,
+            "apikey"    : TWELVE_API_KEY,
+            "format"    : "JSON"
+        }
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        if "values" not in data:
+            log.error("Twelve Data erreur " + symbol + " [" + interval + "]: " + str(data.get("message", "unknown")))
+            return None
+        df = pd.DataFrame(data["values"])
+        df = df.rename(columns={"datetime": "time"})
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col])
+        df = df.iloc[::-1].reset_index(drop=True)
+        return df
+    except Exception as e:
+        log.error("get_candles " + symbol + " [" + interval + "]: " + str(e))
+        return None
 
-function calcATR(candles, p = 14) {
-  let atr = 0;
-  for (let i = 1; i <= p; i++) {
-    atr += Math.max(
-      candles[i].high - candles[i].low,
-      Math.abs(candles[i].high - candles[i-1].close),
-      Math.abs(candles[i].low  - candles[i-1].close)
-    );
-  }
-  atr /= p;
-  for (let i = p+1; i < candles.length; i++) {
-    const tr = Math.max(
-      candles[i].high - candles[i].low,
-      Math.abs(candles[i].high - candles[i-1].close),
-      Math.abs(candles[i].low  - candles[i-1].close)
-    );
-    atr = (atr * (p-1) + tr) / p;
-  }
-  return atr;
-}
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
-function calcEMA(vals, p) {
-  const k = 2 / (p+1);
-  let ema = vals.slice(0,p).reduce((a,b)=>a+b,0)/p;
-  for (let i = p; i < vals.length; i++) ema = vals[i]*k + ema*(1-k);
-  return ema;
-}
+def rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss
+    return 100 - (100 / (1 + rs))
 
-function getSwings(candles, lookback = 5) {
-  const swingHighs = [], swingLows = [];
-  for (let i = lookback; i < candles.length - lookback; i++) {
-    const slice = candles.slice(i - lookback, i + lookback + 1);
-    const maxH  = Math.max(...slice.map(c => c.high));
-    const minL  = Math.min(...slice.map(c => c.low));
-    if (candles[i].high === maxH) swingHighs.push({ i, price: candles[i].high });
-    if (candles[i].low  === minL) swingLows.push({  i, price: candles[i].low  });
-  }
-  return { swingHighs, swingLows };
-}
+def adx(df, period=14):
+    high  = df["high"]
+    low   = df["low"]
+    close = df["close"]
+    plus_dm  = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    atr_raw  = tr.rolling(period).mean()
+    plus_di  = 100 * (plus_dm.rolling(period).mean() / atr_raw)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr_raw)
+    denom    = (plus_di + minus_di).replace(0, pd.NA)
+    dx       = 100 * (plus_di - minus_di).abs() / denom
+    return dx.rolling(period).mean().fillna(0), plus_di, minus_di
 
-function detectCHoCH(candles, swings) {
-  const last = candles[candles.length - 1];
-  const recentHighs = swings.swingHighs.slice(-5);
-  const recentLows  = swings.swingLows.slice(-5);
+def atr(df, period=14):
+    high  = df["high"]
+    low   = df["low"]
+    close = df["close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
-  if (recentHighs.length >= 2) {
-    const lastHigh = recentHighs[recentHighs.length - 1];
-    const prevHigh = recentHighs[recentHighs.length - 2];
-    if (prevHigh.price > lastHigh.price && last.close > lastHigh.price)
-      return { type: "BULLISH_CHOCH", level: lastHigh.price };
-  }
-  if (recentLows.length >= 2) {
-    const lastLow = recentLows[recentLows.length - 1];
-    const prevLow = recentLows[recentLows.length - 2];
-    if (prevLow.price < lastLow.price && last.close < lastLow.price)
-      return { type: "BEARISH_CHOCH", level: lastLow.price };
-  }
-  return null;
-}
+def swing_low(df, n=10):
+    return float(df["low"].iloc[-n-1:-1].min())
 
-function detectLiqSweep(candles, swings) {
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
-  const recentHighs = swings.swingHighs.slice(-4).map(s => s.price);
-  const recentLows  = swings.swingLows.slice(-4).map(s => s.price);
+def swing_high(df, n=10):
+    return float(df["high"].iloc[-n-1:-1].max())
 
-  for (const low of recentLows) {
-    if (prev.low < low && prev.close > low && last.close > low)
-      return { type: "BULLISH_SWEEP", sweptLevel: low };
-    if (last.low < low && last.close > low)
-      return { type: "BULLISH_SWEEP", sweptLevel: low };
-  }
-  for (const high of recentHighs) {
-    if (prev.high > high && prev.close < high && last.close < high)
-      return { type: "BEARISH_SWEEP", sweptLevel: high };
-    if (last.high > high && last.close < high)
-      return { type: "BEARISH_SWEEP", sweptLevel: high };
-  }
-  return null;
-}
+def bullish_reversal_pattern(prev, curr):
+    body_curr = abs(curr["close"] - curr["open"])
+    lower_wick = min(curr["close"], curr["open"]) - curr["low"]
+    upper_wick = curr["high"] - max(curr["close"], curr["open"])
 
-function detectBOS(candles, swings) {
-  const last = candles[candles.length - 1];
-  const recentHighs = swings.swingHighs.slice(-3).map(s => s.price);
-  const recentLows  = swings.swingLows.slice(-3).map(s => s.price);
-  for (const high of recentHighs) if (last.close > high) return { type: "BULLISH_BOS", level: high };
-  for (const low  of recentLows)  if (last.close < low)  return { type: "BEARISH_BOS", level: low };
-  return null;
-}
+    bullish_engulfing = (curr["close"] > curr["open"] and prev["close"] < prev["open"]
+                          and curr["close"] >= prev["open"] and curr["open"] <= prev["close"])
+    hammer = (curr["close"] > curr["open"] and body_curr > 0
+              and lower_wick >= body_curr * 1.5 and upper_wick <= body_curr * 0.5)
+    return bullish_engulfing or hammer
 
-function detectSupplyDemand(candles, atr) {
-  const zones = [];
-  for (let i = 3; i < candles.length - 1; i++) {
-    const body = Math.abs(candles[i].close - candles[i].open);
-    if (body > atr * 1.5) {
-      if (candles[i].close > candles[i].open)
-        zones.push({ type: "DEMAND", top: candles[i].open, bottom: candles[i].low, i });
-      else
-        zones.push({ type: "SUPPLY", top: candles[i].high, bottom: candles[i].open, i });
-    }
-  }
-  return zones.slice(-6);
-}
+def bearish_reversal_pattern(prev, curr):
+    body_curr = abs(curr["close"] - curr["open"])
+    lower_wick = min(curr["close"], curr["open"]) - curr["low"]
+    upper_wick = curr["high"] - max(curr["close"], curr["open"])
 
-function calcFibonacci(swings) {
-  const swingHigh = swings.swingHighs.slice(-1)[0];
-  const swingLow  = swings.swingLows.slice(-1)[0];
-  if (!swingHigh || !swingLow) return null;
-  const range = swingHigh.price - swingLow.price;
-  return {
-    swingHigh: swingHigh.price, swingLow: swingLow.price,
-    f236: parseFloat((swingHigh.price - range * 0.236).toFixed(2)),
-    f382: parseFloat((swingHigh.price - range * 0.382).toFixed(2)),
-    f500: parseFloat((swingHigh.price - range * 0.5).toFixed(2)),
-    f618: parseFloat((swingHigh.price - range * 0.618).toFixed(2)),
-    f706: parseFloat((swingHigh.price - range * 0.706).toFixed(2)),
-    f786: parseFloat((swingHigh.price - range * 0.786).toFixed(2)),
-    f618up: parseFloat((swingLow.price + range * 0.618).toFixed(2)),
-    f706up: parseFloat((swingLow.price + range * 0.706).toFixed(2)),
-    f786up: parseFloat((swingLow.price + range * 0.786).toFixed(2)),
-  };
-}
+    bearish_engulfing = (curr["close"] < curr["open"] and prev["close"] > prev["open"]
+                          and curr["close"] <= prev["open"] and curr["open"] >= prev["close"])
+    shooting_star = (curr["close"] < curr["open"] and body_curr > 0
+                      and upper_wick >= body_curr * 1.5 and lower_wick <= body_curr * 0.5)
+    return bearish_engulfing or shooting_star
 
-function inGoldenZone(price, fib, direction) {
-  if (!fib) return false;
-  if (direction === "BUY")  return price >= fib.f786 && price <= fib.f618;
-  if (direction === "SELL") return price >= fib.f618up && price <= fib.f786up;
-  return false;
-}
+def near_round_number(price, step, atr_now, buffer_mult):
+    nearest = round(price / step) * step
+    return abs(price - nearest) <= atr_now * buffer_mult
 
-function analyzeSMC(candles) {
-  const closes = candles.map(c => c.close);
-  const price  = closes[closes.length - 1];
-  const atr    = calcATR(candles);
-  const ema50  = calcEMA(closes, 50);
-  const ema200 = calcEMA(closes, 200);
+htf_cache = {}
 
-  const swings = getSwings(candles, 5);
-  const choch  = detectCHoCH(candles, swings);
-  const sweep  = detectLiqSweep(candles, swings);
-  const bos    = detectBOS(candles, swings);
-  const zones  = detectSupplyDemand(candles, atr);
-  const fib    = calcFibonacci(swings);
+def get_htf_trend(symbol):
+    df_h1 = get_candles(symbol, interval="1h", outputsize=60)
+    df_h4 = get_candles(symbol, interval="4h", outputsize=60)
+    if df_h1 is None or len(df_h1) < 55 or df_h4 is None or len(df_h4) < 55:
+        return None
 
-  const htfBull    = ema50 > ema200;
-  const nearDemand = zones.find(z => z.type === "DEMAND" && price >= z.bottom && price <= z.top + atr);
-  const nearSupply = zones.find(z => z.type === "SUPPLY" && price <= z.top && price >= z.bottom - atr);
-  const inGoldenBuy  = inGoldenZone(price, fib, "BUY");
-  const inGoldenSell = inGoldenZone(price, fib, "SELL");
+    f1 = float(ema(df_h1["close"], 15).iloc[-1])
+    s1 = float(ema(df_h1["close"], 50).iloc[-1])
+    f4 = float(ema(df_h4["close"], 15).iloc[-1])
+    s4 = float(ema(df_h4["close"], 50).iloc[-1])
 
-  let buyConf = 0, buyReasons = [];
-  if (choch?.type === "BULLISH_CHOCH") { buyConf++; buyReasons.push(`✅ CHoCH haussier à ${choch.level.toFixed(0)}`); }
-  if (sweep?.type === "BULLISH_SWEEP") { buyConf++; buyReasons.push(`✅ Liquidity Sweep haussier à ${sweep.sweptLevel.toFixed(0)}`); }
-  if (bos?.type   === "BULLISH_BOS")   { buyConf++; buyReasons.push(`✅ BOS haussier à ${bos.level.toFixed(0)}`); }
-  if (inGoldenBuy && fib)              { buyConf++; buyReasons.push(`✅ Golden Zone Fibo (${fib.f786.toFixed(0)}-${fib.f618.toFixed(0)})`); }
-  if (nearDemand)                      { buyConf++; buyReasons.push(`✅ Demand Zone (${nearDemand.bottom.toFixed(0)}-${nearDemand.top.toFixed(0)})`); }
-  if (htfBull)                         { buyConf++; buyReasons.push(`✅ Trend HTF haussier (EMA50 > EMA200)`); }
+    h1_dir = "BULL" if f1 > s1 else "BEAR"
+    h4_dir = "BULL" if f4 > s4 else "BEAR"
 
-  let sellConf = 0, sellReasons = [];
-  if (choch?.type === "BEARISH_CHOCH") { sellConf++; sellReasons.push(`✅ CHoCH baissier à ${choch.level.toFixed(0)}`); }
-  if (sweep?.type === "BEARISH_SWEEP") { sellConf++; sellReasons.push(`✅ Liquidity Sweep baissier à ${sweep.sweptLevel.toFixed(0)}`); }
-  if (bos?.type   === "BEARISH_BOS")   { sellConf++; sellReasons.push(`✅ BOS baissier à ${bos.level.toFixed(0)}`); }
-  if (inGoldenSell && fib)             { sellConf++; sellReasons.push(`✅ Golden Zone Fibo (${fib.f618up.toFixed(0)}-${fib.f786up.toFixed(0)})`); }
-  if (nearSupply)                      { sellConf++; sellReasons.push(`✅ Supply Zone (${nearSupply.bottom.toFixed(0)}-${nearSupply.top.toFixed(0)})`); }
-  if (!htfBull)                        { sellConf++; sellReasons.push(`✅ Trend HTF baissier (EMA50 < EMA200)`); }
+    if h1_dir == h4_dir:
+        return h1_dir
+    return None
 
-  const buyValid  = sweep?.type === "BULLISH_SWEEP" && bos?.type === "BULLISH_BOS" && buyConf >= 3;
-  const sellValid = sweep?.type === "BEARISH_SWEEP" && bos?.type === "BEARISH_BOS" && sellConf >= 3;
+def get_htf_trend_cached(symbol):
+    now = datetime.now(timezone.utc).timestamp()
+    cached = htf_cache.get(symbol)
+    if cached and (now - cached[0]) < HTF_CACHE_TTL:
+        return cached[1]
+    trend = get_htf_trend(symbol)
+    htf_cache[symbol] = (now, trend)
+    return trend
 
-  let signal, reasons, conf;
-  if      (buyValid)  { signal = "BUY";  reasons = buyReasons;  conf = buyConf; }
-  else if (sellValid) { signal = "SELL"; reasons = sellReasons; conf = sellConf; }
-  else return null;
+def detect_pullback_entry(df, cfg):
+    closed = df.iloc[:-1]
+    if len(closed) < max(cfg["ema_slow"], cfg["adx_period"]) + 10:
+        return None, None, None, None
 
-  let sl, tp1, tp2;
-  if (signal === "BUY") {
-    sl  = parseFloat((sweep.sweptLevel - atr * 0.3).toFixed(1));
-    const nextHigh = swings.swingHighs.slice(-1)[0];
-    tp1 = nextHigh ? parseFloat(nextHigh.price.toFixed(1)) : parseFloat((price + atr * 2).toFixed(1));
-    tp2 = fib      ? parseFloat(fib.swingHigh.toFixed(1))  : parseFloat((price + atr * 4).toFixed(1));
-  } else {
-    sl  = parseFloat((sweep.sweptLevel + atr * 0.3).toFixed(1));
-    const nextLow = swings.swingLows.slice(-1)[0];
-    tp1 = nextLow ? parseFloat(nextLow.price.toFixed(1)) : parseFloat((price - atr * 2).toFixed(1));
-    tp2 = fib     ? parseFloat(fib.swingLow.toFixed(1))  : parseFloat((price - atr * 4).toFixed(1));
-  }
+    ema_f = ema(closed["close"], cfg["ema_fast"])
+    ema_s = ema(closed["close"], cfg["ema_slow"])
+    atr_s = atr(closed, cfg["atr_period"])
+    adx_s, plus_di, minus_di = adx(closed, cfg["adx_period"])
 
-  const slPts  = parseFloat(Math.abs(price - sl).toFixed(1));
-  const tp1Pts = parseFloat(Math.abs(tp1 - price).toFixed(1));
-  const tp2Pts = parseFloat(Math.abs(tp2 - price).toFixed(1));
-  const rr1    = parseFloat((tp1Pts / slPts).toFixed(1));
-  const rr2    = parseFloat((tp2Pts / slPts).toFixed(1));
+    last = closed.iloc[-1]
+    prev = closed.iloc[-2]
+    ema_f_now = float(ema_f.iloc[-1])
+    ema_s_now = float(ema_s.iloc[-1])
+    atr_now   = float(atr_s.iloc[-1])
+    adx_now   = float(adx_s.iloc[-1])
+    adx_prev  = float(adx_s.iloc[-4])
+    plus_now  = float(plus_di.iloc[-1])
+    minus_now = float(minus_di.iloc[-1])
 
-  return { signal, price, sl, tp1, tp2, slPts, tp1Pts, tp2Pts, rr1, rr2, reasons, conf, fib, atr, ema50, ema200 };
-}
+    price = float(last["close"])
 
-async function fetchNAS100Candles() {
-  const url = `https://api.twelvedata.com/time_series?symbol=NDX&interval=5min&outputsize=150&apikey=${API_KEY}`;
-  const data = await get(url);
-  if (data.status === "error") throw new Error("Twelve Data: " + data.message);
-  if (!data.values || data.values.length === 0) throw new Error("Pas de données NAS100");
-  return data.values.reverse().map(c => ({
-    open: parseFloat(c.open), high: parseFloat(c.high),
-    low:  parseFloat(c.low),  close: parseFloat(c.close), vol: 0,
-  }));
-}
+    atr_pct = (atr_now / price) * 100
+    vol_ok = atr_pct >= cfg["min_atr_pct"]
 
-let lastSignalTime = 0;
-const COOLDOWN = 45 * 60 * 1000;
+    not_near_round = not near_round_number(price, cfg["round_step"], atr_now, cfg["round_buffer"])
 
-async function run() {
-  if (isWeekend()) { console.log("Weekend — marchés fermés."); return; }
-  const session = getSession();
-  if (!session) { console.log(`${new Date().toISOString()} | Hors session NAS100.`); return; }
+    trend_bull = ema_f_now > ema_s_now and plus_now > minus_now
+    trend_bear = ema_f_now < ema_s_now and minus_now > plus_now
+    adx_ok     = adx_now > cfg["adx_min"]
+    adx_rising = adx_now > adx_prev
 
-  try {
-    const candles = await fetchNAS100Candles();
-    const result  = analyzeSMC(candles);
-    const price   = candles[candles.length - 1].close;
+    extension    = abs(price - ema_f_now)
+    not_extended = extension <= atr_now * cfg["ext_mult"]
 
-    if (!result) {
-      console.log(`${new Date().toISOString()} | ${session} | NAS100 ${price.toFixed(1)} | Pas de setup SMC.`);
-      return;
-    }
+    recent = closed.iloc[-3:]
+    touched_from_above = (recent["low"]  <= ema_f_now + atr_now * cfg["pullback_tol"]).any()
+    touched_from_below = (recent["high"] >= ema_f_now - atr_now * cfg["pullback_tol"]).any()
 
-    const now = Date.now();
-    if (now - lastSignalTime < COOLDOWN) { console.log("Cooldown actif."); return; }
-    lastSignalTime = now;
+    bull_pattern = bullish_reversal_pattern(prev, last) and price > ema_f_now
+    bear_pattern = bearish_reversal_pattern(prev, last) and price < ema_f_now
 
-    const emoji  = result.signal === "BUY" ? "🟢" : "🔴";
-    const action = result.signal === "BUY" ? "ACHÈTE" : "VENDS";
+    base_ok = vol_ok and not_near_round and adx_ok and adx_rising and not_extended
 
-    const msg =
-      `${emoji} *SIGNAL NAS100 — ${action}*\n` +
-      `📍 Session : ${session}\n\n` +
-      `💰 Entrée : *${result.price.toFixed(1)}*\n` +
-      `🛑 SL : *${result.slPts.toFixed(1)} pts* (${result.sl.toFixed(1)})\n` +
-      `🎯 TP1 : *${result.tp1Pts.toFixed(1)} pts* (${result.tp1.toFixed(1)}) — R/R 1:${result.rr1}\n` +
-      `🎯 TP2 : *${result.tp2Pts.toFixed(1)} pts* (${result.tp2.toFixed(1)}) — R/R 1:${result.rr2}\n\n` +
-      `*Confluences (${result.conf}/6) :*\n` +
-      result.reasons.join("\n") + "\n\n" +
-      (result.fib ?
-        `*Niveaux Fibo :*\n` +
-        `0.382 → ${result.fib.f382}\n` +
-        `0.500 → ${result.fib.f500}\n` +
-        `0.618 → *${result.fib.f618}* ⭐\n` +
-        `0.706 → *${result.fib.f706}* ⭐\n` +
-        `0.786 → ${result.fib.f786}\n\n` : "") +
-      `📉 ATR : ${result.atr.toFixed(1)} pts | EMA50 : ${result.ema50.toFixed(1)} | EMA200 : ${result.ema200.toFixed(1)}\n\n` +
-      `_Not financial advice._`;
+    if base_ok and trend_bull and touched_from_above and bull_pattern:
+        return "BUY", price, atr_now, closed
+    if base_ok and trend_bear and touched_from_below and bear_pattern:
+        return "SELL", price, atr_now, closed
 
-    await sendTelegram(msg);
-    console.log(`✅ Signal NAS100 : ${action} | ${result.price.toFixed(1)}`);
+    return None, None, None, None
 
-  } catch(e) { console.error("Erreur :", e.message); }
-}
+def compute_levels(direction, price, atr_now, closed, cfg):
+    sl_dist_atr = atr_now * cfg["atr_sl_mult"]
+    if direction == "BUY":
+        sl_struct = swing_low(closed, n=10)
+        sl = min(sl_struct - atr_now * 0.1, price - sl_dist_atr)
+        sl_dist = price - sl
+        tp1 = price + sl_dist
+        tp2 = price + sl_dist * 2
+        tp3 = price + sl_dist * 3
+    else:
+        sl_struct = swing_high(closed, n=10)
+        sl = max(sl_struct + atr_now * 0.1, price + sl_dist_atr)
+        sl_dist = sl - price
+        tp1 = price - sl_dist
+        tp2 = price - sl_dist * 2
+        tp3 = price - sl_dist * 3
+    return round(sl, 2), round(tp1, 2), round(tp2, 2), round(tp3, 2), sl_dist
 
-console.log("NAS100 SMC Bot démarré ✅");
-sendTelegram(
-  "📊 *NAS100 SMC Signal Bot démarré*\n\n" +
-  "Stratégie : Smart Money Concepts\n" +
-  "Logique : CHoCH + Liq Sweep + BOS + Golden Zone Fibo\n" +
-  "Sessions : Pre-Market + NY Open + NY Afternoon\n" +
-  "Actif : NAS100 (NDX) M5\n\n" +
-  "Signaux envoyés uniquement pendant les Kill Zones 🎯"
-);
+def analyze_us100():
+    cfg = US100_CONFIG
+    if minutes_since_session_start() < cfg["session_warmup_min"]:
+        return None
 
-run();
-setInterval(run, 60 * 1000);
+    htf = get_htf_trend_cached(cfg["symbol"])
+    if htf is None:
+        return None
+
+    df = get_candles(cfg["symbol"], outputsize=100)
+    if df is None or len(df) < 60:
+        return None
+
+    direction, price, atr_now, closed = detect_pullback_entry(df, cfg)
+    if direction is None:
+        return None
+    if (direction == "BUY" and htf != "BULL") or (direction == "SELL" and htf != "BEAR"):
+        return None
+
+    rsi_now = float(rsi(closed["close"], cfg["rsi_period"]).iloc[-1])
+    if direction == "BUY" and rsi_now > 70:
+        return None
+    if direction == "SELL" and rsi_now < 30:
+        return None
+
+    sl, tp1, tp2, tp3, sl_dist = compute_levels(direction, price, atr_now, closed, cfg)
+    candle_time = str(closed["time"].iloc[-1])
+    return (direction, round(price, 2), sl, tp1, tp2, tp3, sl_dist, htf, candle_time)
+
+def position_sizing_text(sl_dist, cfg):
+    if ACCOUNT_BALANCE <= 0:
+        return ""
+    risk_amount = ACCOUNT_BALANCE * RISK_PERCENT / 100
+    lot = risk_amount / (sl_dist * cfg["point_value_per_lot"])
+    return ("\n💰 Risque  : " + str(round(risk_amount, 2)) + "€ (" + str(RISK_PERCENT) + "%)\n"
+            "📦 Taille  : ~" + str(round(lot, 2)) + " lot (a verifier selon ton broker)")
+
+def format_message(label, direction, price, sl, tp1, tp2, tp3, sl_dist, htf, cfg):
+    now = datetime.utcnow().strftime("%H:%M UTC")
+    arrow = "🟢" if direction == "BUY" else "🔴"
+    sl_d = round(abs(price - sl), 2)
+
+    msg  = arrow + " " + direction + " SIGNAL - " + label + "\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "🕐 Heure  : " + now + "\n"
+    msg += "📍 Entry  : " + str(price) + "\n"
+    msg += "🛑 SL     : " + str(sl) + "  (-" + str(sl_d) + ")\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "🎯 TP1    : " + str(tp1) + "  (RR 1:1)\n"
+    msg += "🎯 TP2    : " + str(tp2) + "  (RR 1:2)\n"
+    msg += "🎯 TP3    : " + str(tp3) + "  (RR 1:3)\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "📈 Tendance H1+H4 : " + htf + " ✅\n"
+    msg += "📐 Setup  : Pullback + bougie de retournement\n"
+    msg += position_sizing_text(sl_dist, cfg) + "\n"
+    msg += "━━━━━━━━━━━━━━━━━━\n"
+    msg += "📋 Gestion : TP1 -> sécurise 50% + SL a BE | TP2 -> trailing stop\n"
+    msg += "⚠️ Signal indicatif - vérifiez sur MT5 (symbole USTEC pour FTMO)"
+    return msg
+
+last_signal = None
+trade_count = {"date": None, "count": 0}
+
+def can_trade_today():
+    today = datetime.now(timezone.utc).date()
+    if trade_count["date"] != today:
+        trade_count["date"] = today
+        trade_count["count"] = 0
+    return trade_count["count"] < MAX_TRADES_PER_DAY
+
+def register_trade():
+    trade_count["count"] += 1
+
+async def main():
+    global last_signal
+    bot = Bot(token=TELEGRAM_TOKEN)
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text="🤖 US100 Signal Bot v4 démarré\nFiltres pro scalping actifs : pattern de retournement, volatilité min, niveaux ronds, anti-ouverture, max " + str(MAX_TRADES_PER_DAY) + " trades/jour ✅\nSymbole d'exécution : USTEC (FTMO)"
+    )
+    log.info("Bot démarré v4 - US100")
+
+    while True:
+        try:
+            if not is_market_open():
+                log.info("Marché fermé - attente")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+
+            if can_trade_today():
+                us = analyze_us100()
+                if us:
+                    direction, price, sl, tp1, tp2, tp3, sl_dist, htf, candle_time = us
+                    key = direction + "_" + candle_time
+                    if last_signal != key:
+                        msg = format_message("US100", direction, price, sl, tp1, tp2, tp3, sl_dist, htf, US100_CONFIG)
+                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                        last_signal = key
+                        register_trade()
+                        log.info("Signal US100: " + direction + " @ " + str(price) + " | bougie " + candle_time)
+
+        except Exception as e:
+            log.error("Erreur scan: " + str(e))
+
+        await asyncio.sleep(SCAN_INTERVAL)
+
+if __name__ == "__main__":
+    asyncio.run(main())
