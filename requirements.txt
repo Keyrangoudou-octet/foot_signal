@@ -1,0 +1,7 @@
+requests==2.31.0
+beautifulsoup4==4.12.2
+python-telegram-bot==20.7
+schedule==1.2.1
+python-dotenv==1.0.0
+loguru==0.7.2
+lxml==4.9.3
