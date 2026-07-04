@@ -12,7 +12,7 @@ HEADERS = {
     "x-apisports-key": API_KEY,
 }
 
-MIN_PROBABILITY = 55.0
+MIN_PROBABILITY = 50.0
 
 
 def _percent_to_float(pct_str):
