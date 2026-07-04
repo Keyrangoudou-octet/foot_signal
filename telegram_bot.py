@@ -7,8 +7,7 @@ from telegram.error import TelegramError
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHANNEL = os.getenv("TELEGRAM_CHANNEL_ID", "")
-SOURCES = ["Forebet", "PredictZ", "Footystats"]
-
+SOURCES = ["APIFootball"]
 def format_message(picks):
     today = date.today().strftime("%d/%m/%Y")
     lines = [f"🎯 *PRONOSTICS DU JOUR — {today}*", "━━━━━━━━━━━━━━━━━━━━━", ""]
