@@ -76,6 +76,8 @@ def scrape():
             continue
         home_team = fixture["teams"]["home"]["name"]
         away_team = fixture["teams"]["away"]["name"]
+        home_id = fixture["teams"]["home"]["id"]
+        away_id = fixture["teams"]["away"]["id"]
         competition = fixture["league"]["name"]
         match_time = fixture["fixture"]["date"][11:16]
         time.sleep(0.2)
@@ -88,14 +90,26 @@ def scrape():
         p_draw = _percent_to_float(percent.get("draw", "0%"))
         p_away = _percent_to_float(percent.get("away", "0%"))
         best_prob = max(p_home, p_draw, p_away)
-        if best_prob < MIN_PROBABILITY:
-            continue
-        if p_home == best_prob:
-            outcome = "1"
-        elif p_draw == best_prob:
-            outcome = "X"
+        if best_prob >= MIN_PROBABILITY:
+            if p_home == best_prob:
+                outcome = "1"
+            elif p_draw == best_prob:
+                outcome = "X"
+            else:
+                outcome = "2"
         else:
-            outcome = "2"
+            winner = preds.get("winner", {})
+            winner_id = winner.get("id")
+            if winner_id == home_id:
+                outcome = "1"
+                best_prob = 60.0
+            elif winner_id == away_id:
+                outcome = "2"
+                best_prob = 60.0
+            elif winner.get("name", "").lower() in ("draw", "null", ""):
+                continue
+            else:
+                continue
         predictions.append({
             "source": SOURCE_NAME,
             "home_team": home_team,
