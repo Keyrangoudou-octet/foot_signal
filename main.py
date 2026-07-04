@@ -1,32 +1,26 @@
 import argparse, asyncio, sys, time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import schedule
 from dotenv import load_dotenv
 from loguru import logger
 
 load_dotenv()
-from aggregator import aggregate_predictions
-from scrapers import forebet, predictz, footystats
+from scrapers import api_football
 from telegram_bot import format_message, send_message
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 
 def run_scrapers():
-    all_predictions = []
-    jobs = {"Forebet": forebet.scrape, "PredictZ": predictz.scrape, "Footystats": footystats.scrape}
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(fn): name for name, fn in jobs.items()}
-        for f in as_completed(futures):
-            try:
-                all_predictions.extend(f.result())
-            except Exception as e:
-                logger.error(f"{futures[f]} erreur: {e}")
-    return all_predictions
+    raw = api_football.scrape()
+    return [{
+        **p,
+        "avg_probability": round(p["probability"], 1),
+        "sources_count": 1,
+        "sources_list": ["APIFootball"],
+    } for p in raw]
 
 async def run_job():
-    preds = run_scrapers()
-    picks = aggregate_predictions(preds)
+    picks = run_scrapers()
     await send_message(format_message(picks))
 
 def run_now(): asyncio.run(run_job())
