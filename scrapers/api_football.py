@@ -67,43 +67,35 @@ def scrape():
     if not API_KEY:
         logger.error(f"[{SOURCE_NAME}] API_FOOTBALL_KEY manquante")
         return []
-
     predictions = []
     fixtures = _get_fixtures_today()
-
     for fixture in fixtures[:80]:
         fixture_id = fixture["fixture"]["id"]
-                league_id = fixture["league"]["id"]
+        league_id = fixture["league"]["id"]
         if league_id not in ALLOWED_LEAGUES:
             continue
         home_team = fixture["teams"]["home"]["name"]
         away_team = fixture["teams"]["away"]["name"]
         competition = fixture["league"]["name"]
         match_time = fixture["fixture"]["date"][11:16]
-
         time.sleep(0.2)
         pred_data = _get_prediction(fixture_id)
         if not pred_data:
             continue
-
         preds = pred_data.get("predictions", {})
         percent = preds.get("percent", {})
-
         p_home = _percent_to_float(percent.get("home", "0%"))
         p_draw = _percent_to_float(percent.get("draw", "0%"))
         p_away = _percent_to_float(percent.get("away", "0%"))
-
         best_prob = max(p_home, p_draw, p_away)
         if best_prob < MIN_PROBABILITY:
             continue
-
         if p_home == best_prob:
             outcome = "1"
         elif p_draw == best_prob:
             outcome = "X"
         else:
             outcome = "2"
-
         predictions.append({
             "source": SOURCE_NAME,
             "home_team": home_team,
@@ -113,6 +105,5 @@ def scrape():
             "competition": competition,
             "match_time": match_time,
         })
-
     logger.info(f"[{SOURCE_NAME}] {len(predictions)} prédictions retenues")
     return predictions
