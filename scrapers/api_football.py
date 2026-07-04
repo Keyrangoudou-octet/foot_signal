@@ -12,8 +12,20 @@ HEADERS = {
     "x-apisports-key": API_KEY,
 }
 
-MIN_PROBABILITY = 50.0
+MIN_PROBABILITY = 45.0
 
+# Ligues autorisées (Coupe du Monde + grandes compétitions)
+ALLOWED_LEAGUES = {
+    1,    # FIFA World Cup
+    2,    # UEFA Champions League
+    3,    # UEFA Europa League
+    39,   # Premier League
+    140,  # La Liga
+    78,   # Bundesliga
+    135,  # Serie A
+    61,   # Ligue 1
+    13,   # Copa Libertadores
+}
 
 def _percent_to_float(pct_str):
     try:
@@ -61,6 +73,9 @@ def scrape():
 
     for fixture in fixtures[:80]:
         fixture_id = fixture["fixture"]["id"]
+                league_id = fixture["league"]["id"]
+        if league_id not in ALLOWED_LEAGUES:
+            continue
         home_team = fixture["teams"]["home"]["name"]
         away_team = fixture["teams"]["away"]["name"]
         competition = fixture["league"]["name"]
